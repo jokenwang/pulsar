@@ -18,8 +18,23 @@
  */
 package org.apache.pulsar.broker.admin;
 
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.fail;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
@@ -42,6 +57,7 @@ import org.apache.pulsar.client.api.Schema;
 import org.apache.pulsar.client.api.SubscriptionInitialPosition;
 import org.apache.pulsar.client.api.SubscriptionMode;
 import org.apache.pulsar.client.api.SubscriptionType;
+import org.apache.pulsar.common.api.proto.CommandSubscribe;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.BacklogQuota;
 import org.apache.pulsar.common.policies.data.ClusterData;
@@ -55,28 +71,12 @@ import org.apache.pulsar.common.policies.data.RetentionPolicies;
 import org.apache.pulsar.common.policies.data.SubscribeRate;
 import org.apache.pulsar.common.policies.data.TenantInfoImpl;
 import org.apache.pulsar.common.policies.data.TopicStats;
+import org.assertj.core.api.Assertions;
 import org.awaitility.Awaitility;
 import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
-
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-
-import static org.testng.Assert.assertEquals;
-import static org.testng.Assert.assertFalse;
-import static org.testng.Assert.assertNotNull;
-import static org.testng.Assert.assertNull;
-import static org.testng.Assert.assertTrue;
-import static org.testng.Assert.fail;
 
 @Slf4j
 @Test(groups = "broker")
@@ -100,6 +100,7 @@ public class TopicPoliciesTest extends MockedPulsarServiceBaseTest {
         this.conf.setSystemTopicEnabled(true);
         this.conf.setTopicLevelPoliciesEnabled(true);
         this.conf.setDefaultNumberOfNamespaceBundles(1);
+        this.conf.setMaxMessageSizeCheckIntervalInSeconds(1);
         super.internalSetup();
 
         admin.clusters().createCluster("test", ClusterData.builder().serviceUrl(pulsar.getWebServiceAddress()).build());
@@ -1781,8 +1782,14 @@ public class TopicPoliciesTest extends MockedPulsarServiceBaseTest {
             assertEquals(e.getStatusCode(), 412);
         }
 
-        MessageId messageId = producer.send(new byte[1024]);
-        assertNotNull(messageId);
+        Awaitility.await().untilAsserted(() -> {
+            try {
+                MessageId messageId = producer.send(new byte[1024]);
+                assertNotNull(messageId);
+            } catch (PulsarClientException e) {
+                fail("failed to send message");
+            }
+        });
         producer.close();
     }
 
@@ -2144,6 +2151,30 @@ public class TopicPoliciesTest extends MockedPulsarServiceBaseTest {
         assertNull(admin.topics().getMessageTTL(topic));
     }
 
+    @Test
+    public void testSubscriptionTypesWithPartitionedTopic() throws Exception {
+        final String topic = "persistent://" + myNamespace + "/test-" + UUID.randomUUID();
+        admin.topics().createPartitionedTopic(topic, 1);
+        pulsarClient.newConsumer().topic(topic).subscriptionName("test").subscribe().close();
+        Awaitility.await()
+                .until(() -> pulsar.getTopicPoliciesService().cacheIsInitialized(TopicName.get(topic)));
+        Set<SubscriptionType> subscriptionTypeSet = new HashSet<>();
+        subscriptionTypeSet.add(SubscriptionType.Key_Shared);
+        admin.topics().setSubscriptionTypesEnabled(topic, subscriptionTypeSet);
+        Awaitility.await().untilAsserted(() -> assertNotNull(admin.topics().getSubscriptionTypesEnabled(topic)));
+
+        PersistentTopic persistentTopic = (PersistentTopic) pulsar.getBrokerService()
+                .getTopicReference(TopicName.get(topic).getPartition(0).toString()).get();
+        Set<String> old = new HashSet<>(pulsar.getConfiguration().getSubscriptionTypesEnabled());
+        try {
+            pulsar.getConfiguration().getSubscriptionTypesEnabled().clear();
+            assertTrue(persistentTopic.checkSubscriptionTypesEnable(CommandSubscribe.SubType.Key_Shared));
+        } finally {
+            //restore
+            pulsar.getConfiguration().getSubscriptionTypesEnabled().addAll(old);
+        }
+    }
+
     @Test(timeOut = 30000)
     public void testSubscriptionTypesEnabled() throws Exception {
         final String topic = "persistent://" + myNamespace + "/test-" + UUID.randomUUID();
@@ -2363,6 +2394,66 @@ public class TopicPoliciesTest extends MockedPulsarServiceBaseTest {
                     TimeUnit.MINUTES.toMillis(topicRetentionPolicies.getRetentionTimeInMinutes()));
             Assert.assertEquals(config.getRetentionSizeInMB(), topicRetentionPolicies.getRetentionSizeInMB());
         });
+    }
+
+    @Test
+    public void testPolicyIsDeleteTogetherManually() throws Exception {
+        final String topic = testTopic + UUID.randomUUID();
+        pulsarClient.newProducer().topic(topic).create().close();
+
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getTopicPoliciesService().getTopicPolicies(TopicName.get(topic)))
+                        .isNull());
+
+        int maxConsumersPerSubscription = 10;
+        admin.topics().setMaxConsumersPerSubscription(topic, maxConsumersPerSubscription);
+
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getBrokerService().getTopic(topic, false).get().isPresent()).isTrue());
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getTopicPoliciesService().getTopicPolicies(TopicName.get(topic)))
+                        .isNotNull());
+
+        admin.topics().delete(topic);
+
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getBrokerService().getTopic(topic, false).get().isPresent()).isFalse());
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getTopicPoliciesService().getTopicPolicies(TopicName.get(topic)))
+                        .isNull());
+    }
+
+    @Test
+    public void testPolicyIsDeleteTogetherAutomatically() throws Exception {
+        final String topic = testTopic + UUID.randomUUID();
+        pulsarClient.newProducer().topic(topic).create().close();
+
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getTopicPoliciesService().getTopicPolicies(TopicName.get(topic)))
+                        .isNull());
+
+        int maxConsumersPerSubscription = 10;
+        admin.topics().setMaxConsumersPerSubscription(topic, maxConsumersPerSubscription);
+
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getBrokerService().getTopic(topic, false).get().isPresent()).isTrue());
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getTopicPoliciesService().getTopicPolicies(TopicName.get(topic)))
+                        .isNotNull());
+
+        InactiveTopicPolicies inactiveTopicPolicies =
+                new InactiveTopicPolicies(InactiveTopicDeleteMode.delete_when_no_subscriptions, 3, true);
+        admin.topics().setInactiveTopicPolicies(topic, inactiveTopicPolicies);
+
+        Thread.sleep(4_000L);
+
+        pulsar.getBrokerService().checkGC();
+
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getBrokerService().getTopic(topic, false).get().isPresent()).isFalse());
+        Awaitility.await().untilAsserted(() ->
+                Assertions.assertThat(pulsar.getTopicPoliciesService().getTopicPolicies(TopicName.get(topic)))
+                        .isNull());
     }
 
 }
